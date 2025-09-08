@@ -10,6 +10,45 @@ import streamlit as st
 
 
 # ============================
+# Robust I/O: CSV + Excel with encoding/delimiter fallback
+# ============================
+@st.cache_data(show_spinner=False)
+def load_table(uploaded_file) -> pd.DataFrame:
+    """
+    Try to read CSV (any delimiter) or Excel, with encoding fallbacks.
+    """
+    name = uploaded_file.name.lower()
+
+    # Excel directly
+    if name.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+    if name.endswith(".xls"):
+        return pd.read_excel(uploaded_file, engine="xlrd")
+
+    # CSV and unknown types: try UTF-8 with auto delimiter, then cp1252, then latin-1
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            uploaded_file.seek(0)
+            # sep=None + engine="python" lets pandas sniff the delimiter
+            return pd.read_csv(uploaded_file, sep=None, engine="python", encoding=enc)
+        except Exception:
+            continue
+
+    # Final fallback: try reading as Excel (some instruments export XLSX with CSV extension)
+    uploaded_file.seek(0)
+    try:
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+    except Exception:
+        uploaded_file.seek(0)
+        return pd.read_excel(uploaded_file, engine="xlrd")
+
+
+@st.cache_data(show_spinner=False)
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+# ============================
 # Model (Flitt & Schweinsberg)
 # ============================
 @dataclass
@@ -37,20 +76,27 @@ class FlittParams:
     i_offset: float = 0.0
 
 
+# Prevent overflow: 10**x where x is clipped to [-300, 300] (double precision safe)
+def pow10_clip(x):
+    return np.power(10.0, np.clip(x, -300.0, 300.0))
+
+
 def tafels_anodic(E, log_i0, b, Eeq):
     # i_a > 0
-    return 10.0 ** (log_i0 + (E - Eeq) / b)
+    return pow10_clip(log_i0 + (E - Eeq) / b)
 
 
 def tafels_cathodic_abs(E, log_i0, b, Eeq):
     # returns positive magnitude of cathodic kinetic current
-    return 10.0 ** (log_i0 - (E - Eeq) / b)
+    return pow10_clip(log_i0 - (E - Eeq) / b)
 
 
 def orr_with_diffusion(E, log_i0, b, Eeq, i_L):
     # Koutecký–Levich mix of kinetic and diffusion limit for ORR
     ik_abs = tafels_cathodic_abs(E, log_i0, b, Eeq)
-    i_abs = 1.0 / (1.0 / (ik_abs + 1e-300) + 1.0 / (abs(i_L) + 1e-300))
+    # Protect against zeros
+    denom = (1.0 / (ik_abs + 1e-300)) + (1.0 / (abs(i_L) + 1e-300))
+    i_abs = 1.0 / denom
     return -i_abs  # cathodic sign
 
 
@@ -72,6 +118,11 @@ def predict_current_for_measured_potential(Em: np.ndarray, p: FlittParams, n_ite
         i_pred, comps = partial_currents_at_internal_potential(Eint, p)
         Eint = Em - i_pred * p.R_s
     i_pred = i_pred + p.i_offset
+
+    # Ensure finite
+    i_pred = np.nan_to_num(i_pred, nan=0.0, posinf=np.sign(i_pred) * 1e308, neginf=np.sign(i_pred) * -1e308)
+    for k in list(comps.keys()):
+        comps[k] = np.nan_to_num(comps[k], nan=0.0, posinf=1e308, neginf=-1e308)
     return i_pred, comps
 
 
@@ -101,19 +152,28 @@ def unpack_params(x: np.ndarray) -> FlittParams:
     )
 
 
-def default_bounds(I: np.ndarray):
+def default_bounds(I: np.ndarray, E: np.ndarray | None = None):
     i_abs = np.nanmax(np.abs(I)) if I.size and np.isfinite(np.nanmax(np.abs(I))) else 1.0
     i_abs = max(i_abs, 1.0)
+
+    # If we have potentials, keep Eeq near data to avoid absurd exponents
+    if E is not None and E.size:
+        Emin, Emax = float(np.nanmin(E)), float(np.nanmax(E))
+        E_margin = max(0.2, 0.2 * (Emax - Emin))
+        E_low, E_high = Emin - E_margin, Emax + E_margin
+    else:
+        E_low, E_high = -1.5, 1.5
+
     lb = np.array([
         -12, -12, -12,      # log_i0
         0.02, 0.02, 0.02,   # b (V/dec)
-        -1.5, -1.5, -1.5,   # Eeq (V)
+        E_low, E_low, E_low,   # Eeq bounds tightened to data range
         1e-9, 0.0, -i_abs,  # i_L, R_s, i_offset
     ], dtype=float)
     ub = np.array([
         -2, -2, -2,
         0.25, 0.25, 0.25,
-        1.5, 1.5, 1.5,
+        E_high, E_high, E_high,
         max(10*i_abs, 1e-6), 300.0, i_abs,
     ], dtype=float)
     return lb, ub
@@ -122,14 +182,24 @@ def default_bounds(I: np.ndarray):
 def objective(x: np.ndarray, Em: np.ndarray, Iobs: np.ndarray, w_lin: float, w_log: float) -> np.ndarray:
     p = unpack_params(x)
     Ipred, _ = predict_current_for_measured_potential(Em, p)
+
+    # Clip predicted current to keep residuals bounded (stabilizes early iterations)
+    cap = max(1.0, 1e6 * (np.nanmax(np.abs(Iobs)) if Iobs.size else 1.0))
+    Ipred = np.clip(Ipred, -cap, cap)
+
     res_lin = (Ipred - Iobs)
     # log residual on |I|
-    eps = 1e-15
+    eps = 1e-20
     mask = (np.abs(Iobs) > 10*eps) & (np.abs(Ipred) > 10*eps)
     res_log = np.zeros_like(Iobs)
     res_log[mask] = (np.log10(np.abs(Ipred[mask])) - np.log10(np.abs(Iobs[mask])))
+
     scale = max(np.nanmax(np.abs(Iobs)), 1.0)
-    return np.concatenate([w_lin * res_lin / scale, w_log * res_log])
+    res = np.concatenate([w_lin * res_lin / scale, w_log * res_log])
+
+    # Replace any non-finite residuals with large finite numbers to keep optimizer alive
+    res = np.nan_to_num(res, nan=1e6, posinf=1e6, neginf=-1e6)
+    return res
 
 
 def fit_flitt(Em: np.ndarray,
@@ -164,32 +234,6 @@ def fit_flitt(Em: np.ndarray,
 
 
 # ============================
-# Data I/O (CSV + Excel)
-# ============================
-@st.cache_data(show_spinner=False)
-def load_table(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    if name.endswith(".xlsx"):
-        return pd.read_excel(uploaded_file, engine="openpyxl")
-    if name.endswith(".xls"):
-        return pd.read_excel(uploaded_file, engine="xlrd")
-    # fallback
-    try:
-        uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file)
-    except Exception:
-        uploaded_file.seek(0)
-        return pd.read_excel(uploaded_file)
-
-
-@st.cache_data(show_spinner=False)
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
-# ============================
 # Streamlit UI
 # ============================
 st.set_page_config(page_title="Polarization Fit (Flitt & Schweinsberg)", page_icon="🧪", layout="wide")
@@ -198,7 +242,7 @@ st.title("🧪 Polarization Curve Fit — Flitt & Schweinsberg deconstruction")
 st.markdown(
     "Upload your LSV file (CSV or Excel), select the potential and current columns, "
     "and fit a model composed of anodic Fe dissolution, HER, and ORR with a diffusion limit. "
-    "You can lock known parameters (e.g., i_L, R_s, Eeq from pH/reference)."
+    "Lock known parameters (i_L, R_s, Eeq from pH/reference) for stability."
 )
 
 # ---- Upload
@@ -216,9 +260,9 @@ default_cur_cols = ["WE(1).Current (A)"]
 num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
 pot_guess = next((c for c in default_pot_cols if c in df.columns), (num_cols[0] if num_cols else df.columns[0]))
-cur_guess = next((c for c in default_cur_cols if c in df.columns), (num_cols[1] if len(num_cols) > 1 else df.columns[1]))
+cur_guess = next((c for c in default_cur_cols if c in df.columns), (num_cols[1] if len(num_cols) > 1 else df.columns[max(1, len(df.columns)-1)]))
 
-c1, c2, c3 = st.columns([1.4, 1.4, 1])
+c1, c2, c3 = st.columns([1.6, 1.6, 1])
 pot_col = c1.selectbox("Potential column", options=df.columns.tolist(), index=df.columns.get_loc(pot_guess))
 cur_col = c2.selectbox("Current column", options=df.columns.tolist(), index=df.columns.get_loc(cur_guess))
 invert_I = c3.checkbox("Invert current sign", value=False, help="Tick if your cathodic currents appear positive.")
@@ -240,8 +284,16 @@ if invert_I:
 if use_current_density:
     I = I / float(area_cm2)
 
+if E.size < 5:
+    st.error("Not enough valid points after filtering. Check your column selection and row range.")
+    st.stop()
+
 with st.expander("Data preview"):
-    st.dataframe(df.iloc[row_range[0]:row_range[1]+1][[pot_col, cur_col]].head(20), use_container_width=True)
+    prev = df.iloc[row_range[0]:row_range[1]+1][[pot_col, cur_col]].head(20)
+    if invert_I:
+        prev = prev.copy()
+        prev[cur_col] = -prev[cur_col]
+    st.dataframe(prev, use_container_width=True)
 
 # ---- Initial guesses
 p0 = FlittParams()
@@ -282,7 +334,7 @@ w_lin = cW1.slider("Weight: linear residual", 0.0, 5.0, 1.0, 0.1)
 w_log = cW2.slider("Weight: log10(|I|) residual", 0.0, 5.0, 1.0, 0.1)
 
 # Bounds and locks
-lb, ub = default_bounds(I)
+lb, ub = default_bounds(I, E)
 names = ["log_i0_a","log_i0_H","log_i0_O2","b_a","b_H","b_O2","Eeq_a","Eeq_H","Eeq_O2","i_L","R_s","i_offset"]
 locks = [lock_log_i0_a, lock_log_i0_H, lock_log_i0_O2, lock_b_a, lock_b_H, lock_b_O2,
          lock_Eeq_a, lock_Eeq_H, lock_Eeq_O2, lock_i_L, lock_R_s, lock_i_offset]
@@ -324,8 +376,8 @@ ax1.set_xlabel("Potential (V)"); ax1.set_ylabel("Current (A/cm²)" if use_curren
 ax1.legend(); ax1.grid(True, alpha=0.3); ax1.set_title("Polarization fit")
 # Semilog |I|
 ax2 = plt.subplot(2, 2, 2)
-ax2.semilogy(E, np.abs(I)+1e-18, "k.", ms=3, label="|Data|")
-ax2.semilogy(E, np.abs(Ipred)+1e-18, "r-", lw=2, label="|Fit|")
+ax2.semilogy(E, np.abs(I)+1e-30, "k.", ms=3, label="|Data|")
+ax2.semilogy(E, np.abs(Ipred)+1e-30, "r-", lw=2, label="|Fit|")
 ax2.set_xlabel("Potential (V)"); ax2.set_ylabel("|Current| (A/cm²)" if use_current_density else "|Current| (A)")
 ax2.legend(); ax2.grid(True, which="both", alpha=0.3)
 # Components
