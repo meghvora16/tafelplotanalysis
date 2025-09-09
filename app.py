@@ -176,31 +176,45 @@ def guess_iL(E, I):
 
 
 def default_bounds(I: np.ndarray, E: Optional[np.ndarray] = None):
+    """
+    Wider, safe bounds that always include typical Eeq values.
+    """
     i_abs = np.nanmax(np.abs(I)) if I.size and np.isfinite(np.nanmax(np.abs(I))) else 1.0
     i_abs = max(i_abs, 1.0)
 
-    # Keep Eeq near observed potentials
+    # Keep Eeq well inside a wide window
     if E is not None and E.size:
         Emin, Emax = float(np.nanmin(E)), float(np.nanmax(E))
-        E_margin = max(0.15, 0.2 * (Emax - Emin))
-        E_low, E_high = Emin - E_margin, Emax + E_margin
+        # expand at least ±0.6 V beyond data, also guarantee at least [-2, 2]
+        E_low = min(Emin - 0.6, -2.0)
+        E_high = max(Emax + 0.6, 2.0)
     else:
-        E_low, E_high = -1.5, 1.5
+        E_low, E_high = -2.0, 2.0
 
-    # Tighter bounds to avoid unphysical blow-up
     lb = np.array([
-        -10.0, -12.0, -12.0,  # log_i0_a, log_i0_H, log_i0_O2
-        0.03,  0.06,  0.06,   # b_a, b_H, b_O2 (V/dec)
+        -12.0, -12.0, -12.0,  # log_i0s (allow very small i0)
+        0.03,  0.06,  0.06,   # b's (V/dec), realistic ranges
         E_low, E_low, E_low,  # Eeqs
         1e-9,  0.0,  -i_abs   # i_L, R_s, i_offset
     ], dtype=float)
     ub = np.array([
-        -3.5,  -8.0,  -6.0,
-        0.15,  0.18,  0.18,
+        -2.0,  -6.0,  -5.0,
+        0.18,  0.20,  0.20,
         E_high, E_high, E_high,
         max(10*i_abs, 1e-6), 300.0, i_abs
     ], dtype=float)
     return lb, ub
+
+
+def clamp_initial_guess(p0: FlittParams, lb: np.ndarray, ub: np.ndarray) -> FlittParams:
+    """
+    Ensure the starting vector lies strictly inside the bounds to avoid
+    least_squares complaining about the initial guess.
+    """
+    x = pack_params(p0)
+    eps = 1e-12
+    x = np.minimum(np.maximum(x, lb + eps), ub - eps)
+    return unpack_params(x)
 
 
 def objective(x: np.ndarray, Em: np.ndarray, Iobs: np.ndarray, w_lin: float, w_log: float,
@@ -235,7 +249,12 @@ def fit_flitt(Em: np.ndarray,
               w_log: float = 1.0,
               include_HER: bool = True,
               include_ORR: bool = True):
-    x0 = pack_params(p0)
+    # Extra safety: clamp inside bounds
+    lb, ub = bounds
+    x0 = pack_params(clamp_initial_guess(p0, lb, ub))
+    # If any fixed bounds collapsed (lb==ub), adjust x0 exactly
+    x0 = np.where(lb == ub, lb, x0)
+
     res = least_squares(
         objective, x0, bounds=bounds,
         args=(Em, Iobs, w_lin, w_log, include_HER, include_ORR),
@@ -379,6 +398,9 @@ for i, (name, locked) in enumerate(zip(names, locks)):
         val = getattr(p0, name)
         lb[i] = val
         ub[i] = val
+
+# Clamp initial guess to avoid "Initial guess is outside bounds"
+p0 = clamp_initial_guess(p0, lb, ub)
 
 # ---- Fit
 cfit1, cfit2 = st.columns([1, 1])
