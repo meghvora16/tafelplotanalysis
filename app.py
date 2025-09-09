@@ -1,6 +1,6 @@
 import io
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,10 @@ import streamlit as st
 @st.cache_data(show_spinner=False)
 def load_table(uploaded_file) -> pd.DataFrame:
     """
-    Try to read CSV (any delimiter) or Excel, with encoding fallbacks.
+    Read CSV or Excel with robust fallbacks:
+    - .xlsx with openpyxl
+    - .xls with xlrd
+    - CSV with auto delimiter and encoding retries (utf-8-sig, cp1252, latin-1)
     """
     name = uploaded_file.name.lower()
 
@@ -25,16 +28,15 @@ def load_table(uploaded_file) -> pd.DataFrame:
     if name.endswith(".xls"):
         return pd.read_excel(uploaded_file, engine="xlrd")
 
-    # CSV and unknown types: try UTF-8 with auto delimiter, then cp1252, then latin-1
+    # CSV or unknown extension
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             uploaded_file.seek(0)
-            # sep=None + engine="python" lets pandas sniff the delimiter
             return pd.read_csv(uploaded_file, sep=None, engine="python", encoding=enc)
         except Exception:
-            continue
+            pass
 
-    # Final fallback: try reading as Excel (some instruments export XLSX with CSV extension)
+    # Fallback: some files may actually be Excel with a CSV extension
     uploaded_file.seek(0)
     try:
         return pd.read_excel(uploaded_file, engine="openpyxl")
@@ -49,7 +51,7 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ============================
-# Model (Flitt & Schweinsberg)
+# Flitt & Schweinsberg model
 # ============================
 @dataclass
 class FlittParams:
@@ -94,33 +96,40 @@ def tafels_cathodic_abs(E, log_i0, b, Eeq):
 def orr_with_diffusion(E, log_i0, b, Eeq, i_L):
     # Koutecký–Levich mix of kinetic and diffusion limit for ORR
     ik_abs = tafels_cathodic_abs(E, log_i0, b, Eeq)
-    # Protect against zeros
     denom = (1.0 / (ik_abs + 1e-300)) + (1.0 / (abs(i_L) + 1e-300))
     i_abs = 1.0 / denom
     return -i_abs  # cathodic sign
 
 
-def partial_currents_at_internal_potential(Eint: np.ndarray, p: FlittParams):
+def partial_currents_at_internal_potential(Eint: np.ndarray, p: FlittParams,
+                                           include_HER: bool = True,
+                                           include_ORR: bool = True):
     ia = tafels_anodic(Eint, p.log_i0_a, p.b_a, p.Eeq_a)
-    iH = -tafels_cathodic_abs(Eint, p.log_i0_H, p.b_H, p.Eeq_H)
-    iO2 = orr_with_diffusion(Eint, p.log_i0_O2, p.b_O2, p.Eeq_O2, p.i_L)
-    components = {"anodic_Fe": ia, "HER": iH, "ORR": iO2}
-    imix = ia + iH + iO2
+    iH = -tafels_cathodic_abs(Eint, p.log_i0_H, p.b_H, p.Eeq_H) if include_HER else 0.0
+    iO2 = orr_with_diffusion(Eint, p.log_i0_O2, p.b_O2, p.Eeq_O2, p.i_L) if include_ORR else 0.0
+    components = {
+        "anodic_Fe": ia,
+        "HER": (iH if include_HER else np.zeros_like(Eint)),
+        "ORR": (iO2 if include_ORR else np.zeros_like(Eint)),
+    }
+    imix = ia + (iH if include_HER else 0.0) + (iO2 if include_ORR else 0.0)
     return imix, components
 
 
-def predict_current_for_measured_potential(Em: np.ndarray, p: FlittParams, n_iter: int = 5):
+def predict_current_for_measured_potential(Em: np.ndarray, p: FlittParams, n_iter: int = 5,
+                                           include_HER: bool = True,
+                                           include_ORR: bool = True):
     # Iterate to include ohmic drop: Eint = Em - i*R_s
     Eint = Em.copy()
     i_pred = np.zeros_like(Em)
     comps = {}
     for _ in range(max(1, n_iter)):
-        i_pred, comps = partial_currents_at_internal_potential(Eint, p)
+        i_pred, comps = partial_currents_at_internal_potential(Eint, p, include_HER, include_ORR)
         Eint = Em - i_pred * p.R_s
     i_pred = i_pred + p.i_offset
 
     # Ensure finite
-    i_pred = np.nan_to_num(i_pred, nan=0.0, posinf=np.sign(i_pred) * 1e308, neginf=np.sign(i_pred) * -1e308)
+    i_pred = np.nan_to_num(i_pred, nan=0.0, posinf=1e308, neginf=-1e308)
     for k in list(comps.keys()):
         comps[k] = np.nan_to_num(comps[k], nan=0.0, posinf=1e308, neginf=-1e308)
     return i_pred, comps
@@ -152,38 +161,55 @@ def unpack_params(x: np.ndarray) -> FlittParams:
     )
 
 
-def default_bounds(I: np.ndarray, E: np.ndarray | None = None):
+def estimate_Ecorr(E, I):
+    if I.size == 0:
+        return 0.0
+    return float(E[np.nanargmin(np.abs(I))])
+
+
+def guess_iL(E, I):
+    Ec = estimate_Ecorr(E, I)
+    cath_mask = E < (Ec - 0.15)
+    if np.any(cath_mask):
+        return float(np.nanpercentile(np.abs(I[cath_mask]), 95))
+    return float(0.3 * np.nanmax(np.abs(I))) if I.size else 1e-6
+
+
+def default_bounds(I: np.ndarray, E: Optional[np.ndarray] = None):
     i_abs = np.nanmax(np.abs(I)) if I.size and np.isfinite(np.nanmax(np.abs(I))) else 1.0
     i_abs = max(i_abs, 1.0)
 
-    # If we have potentials, keep Eeq near data to avoid absurd exponents
+    # Keep Eeq near observed potentials
     if E is not None and E.size:
         Emin, Emax = float(np.nanmin(E)), float(np.nanmax(E))
-        E_margin = max(0.2, 0.2 * (Emax - Emin))
+        E_margin = max(0.15, 0.2 * (Emax - Emin))
         E_low, E_high = Emin - E_margin, Emax + E_margin
     else:
         E_low, E_high = -1.5, 1.5
 
+    # Tighter bounds to avoid unphysical blow-up
     lb = np.array([
-        -12, -12, -12,      # log_i0
-        0.02, 0.02, 0.02,   # b (V/dec)
-        E_low, E_low, E_low,   # Eeq bounds tightened to data range
-        1e-9, 0.0, -i_abs,  # i_L, R_s, i_offset
+        -10.0, -12.0, -12.0,  # log_i0_a, log_i0_H, log_i0_O2
+        0.03,  0.06,  0.06,   # b_a, b_H, b_O2 (V/dec)
+        E_low, E_low, E_low,  # Eeqs
+        1e-9,  0.0,  -i_abs   # i_L, R_s, i_offset
     ], dtype=float)
     ub = np.array([
-        -2, -2, -2,
-        0.25, 0.25, 0.25,
+        -3.5,  -8.0,  -6.0,
+        0.15,  0.18,  0.18,
         E_high, E_high, E_high,
-        max(10*i_abs, 1e-6), 300.0, i_abs,
+        max(10*i_abs, 1e-6), 300.0, i_abs
     ], dtype=float)
     return lb, ub
 
 
-def objective(x: np.ndarray, Em: np.ndarray, Iobs: np.ndarray, w_lin: float, w_log: float) -> np.ndarray:
+def objective(x: np.ndarray, Em: np.ndarray, Iobs: np.ndarray, w_lin: float, w_log: float,
+              include_HER: bool, include_ORR: bool) -> np.ndarray:
     p = unpack_params(x)
-    Ipred, _ = predict_current_for_measured_potential(Em, p)
-
-    # Clip predicted current to keep residuals bounded (stabilizes early iterations)
+    Ipred, _ = predict_current_for_measured_potential(Em, p,
+                                                      include_HER=include_HER,
+                                                      include_ORR=include_ORR)
+    # Bound predictions to keep residuals stable
     cap = max(1.0, 1e6 * (np.nanmax(np.abs(Iobs)) if Iobs.size else 1.0))
     Ipred = np.clip(Ipred, -cap, cap)
 
@@ -197,9 +223,8 @@ def objective(x: np.ndarray, Em: np.ndarray, Iobs: np.ndarray, w_lin: float, w_l
     scale = max(np.nanmax(np.abs(Iobs)), 1.0)
     res = np.concatenate([w_lin * res_lin / scale, w_log * res_log])
 
-    # Replace any non-finite residuals with large finite numbers to keep optimizer alive
-    res = np.nan_to_num(res, nan=1e6, posinf=1e6, neginf=-1e6)
-    return res
+    # Ensure finite residuals
+    return np.nan_to_num(res, nan=1e6, posinf=1e6, neginf=-1e6)
 
 
 def fit_flitt(Em: np.ndarray,
@@ -207,11 +232,13 @@ def fit_flitt(Em: np.ndarray,
               p0: FlittParams,
               bounds,
               w_lin: float = 1.0,
-              w_log: float = 1.0):
+              w_log: float = 1.0,
+              include_HER: bool = True,
+              include_ORR: bool = True):
     x0 = pack_params(p0)
     res = least_squares(
         objective, x0, bounds=bounds,
-        args=(Em, Iobs, w_lin, w_log),
+        args=(Em, Iobs, w_lin, w_log, include_HER, include_ORR),
         method="trf", max_nfev=5000, ftol=1e-10, xtol=1e-10
     )
     p_fit = unpack_params(res.x)
@@ -220,8 +247,8 @@ def fit_flitt(Em: np.ndarray,
     try:
         J = res.jac
         _, s, VT = np.linalg.svd(J, full_matrices=False)
-        thresh = np.finfo(float).eps * max(J.shape) * s[0]
-        s = s[s > thresh]
+        threshold = np.finfo(float).eps * max(J.shape) * s[0]
+        s = s[s > threshold]
         VT = VT[:s.size]
         cov = (VT.T / (s**2)) @ VT
         dof = max(1, len(res.fun) - len(res.x))
@@ -241,8 +268,8 @@ st.title("🧪 Polarization Curve Fit — Flitt & Schweinsberg deconstruction")
 
 st.markdown(
     "Upload your LSV file (CSV or Excel), select the potential and current columns, "
-    "and fit a model composed of anodic Fe dissolution, HER, and ORR with a diffusion limit. "
-    "Lock known parameters (i_L, R_s, Eeq from pH/reference) for stability."
+    "and fit a mixed-current model: anodic Fe dissolution (Tafel), HER (Tafel), "
+    "and ORR (Tafel mixed with diffusion limit). Include optional iR-drop."
 )
 
 # ---- Upload
@@ -260,12 +287,17 @@ default_cur_cols = ["WE(1).Current (A)"]
 num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
 pot_guess = next((c for c in default_pot_cols if c in df.columns), (num_cols[0] if num_cols else df.columns[0]))
-cur_guess = next((c for c in default_cur_cols if c in df.columns), (num_cols[1] if len(num_cols) > 1 else df.columns[max(1, len(df.columns)-1)]))
+# fallback for current column
+if len(df.columns) > 1:
+    cur_guess = next((c for c in default_cur_cols if c in df.columns),
+                     (num_cols[1] if len(num_cols) > 1 else df.columns[1]))
+else:
+    cur_guess = pot_guess  # degenerate case; user must choose
 
 c1, c2, c3 = st.columns([1.6, 1.6, 1])
 pot_col = c1.selectbox("Potential column", options=df.columns.tolist(), index=df.columns.get_loc(pot_guess))
 cur_col = c2.selectbox("Current column", options=df.columns.tolist(), index=df.columns.get_loc(cur_guess))
-invert_I = c3.checkbox("Invert current sign", value=False, help="Tick if your cathodic currents appear positive.")
+invert_I = c3.checkbox("Invert current sign", value=False, help="Tick if cathodic currents appear positive in your data.")
 
 # ---- Pre-processing
 row_range = st.slider("Row range to include", 0, len(df)-1, (0, len(df)-1))
@@ -289,17 +321,21 @@ if E.size < 5:
     st.stop()
 
 with st.expander("Data preview"):
-    prev = df.iloc[row_range[0]:row_range[1]+1][[pot_col, cur_col]].head(20)
+    prev = df.iloc[row_range[0]:row_range[1]+1][[pot_col, cur_col]].head(20).copy()
     if invert_I:
-        prev = prev.copy()
         prev[cur_col] = -prev[cur_col]
     st.dataframe(prev, use_container_width=True)
 
+# ---- Include/exclude processes
+st.subheader("Processes to include")
+c_inc1, c_inc2 = st.columns(2)
+include_HER = c_inc1.checkbox("Include HER", value=True)
+include_ORR = c_inc2.checkbox("Include ORR", value=True)
+
 # ---- Initial guesses
 p0 = FlittParams()
-i_abs_guess = float(np.nanmax(np.abs(I))) if I.size else 1e-3
-if np.isfinite(i_abs_guess) and i_abs_guess > 0:
-    p0.i_L = max(1e-9, 0.3 * i_abs_guess)
+# i_L guess from cathodic tail
+p0.i_L = max(1e-9, guess_iL(E, I))
 
 st.subheader("Model parameters (set and optionally lock)")
 def param_input(label, value, step, fmt="%.5f", help_txt="", lock_key=None):
@@ -351,7 +387,9 @@ if not run:
     st.stop()
 
 with st.spinner("Fitting model..."):
-    p_fit, info = fit_flitt(E, I, p0=p0, bounds=(lb, ub), w_lin=w_lin, w_log=w_log)
+    p_fit, info = fit_flitt(E, I, p0=p0, bounds=(lb, ub),
+                            w_lin=w_lin, w_log=w_log,
+                            include_HER=include_HER, include_ORR=include_ORR)
 st.success(info.get("message", "Done"))
 
 # ---- Results table
@@ -365,7 +403,9 @@ st.subheader("Fitted parameters")
 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 # ---- Plots and diagnostics
-Ipred, comps = predict_current_for_measured_potential(E, p_fit)
+Ipred, comps = predict_current_for_measured_potential(E, p_fit,
+                                                      include_HER=include_HER,
+                                                      include_ORR=include_ORR)
 
 fig = plt.figure(figsize=(11, 8))
 # Linear I–E
@@ -401,7 +441,9 @@ st.pyplot(fig, clear_figure=False)
 # Ecorr/Icorr estimate from the fitted model
 try:
     Egrid = np.linspace(min(E)-0.5, max(E)+0.5, 4000)
-    Igrid, _ = predict_current_for_measured_potential(Egrid, p_fit)
+    Igrid, _ = predict_current_for_measured_potential(Egrid, p_fit,
+                                                      include_HER=include_HER,
+                                                      include_ORR=include_ORR)
     idx = np.argmin(np.abs(Igrid))
     Ecorr_est, Icorr_est = Egrid[idx], Igrid[idx]
     st.info(f"Estimated E_corr ≈ {Ecorr_est:.6f} V, I_corr ≈ {Icorr_est:.3e} "
@@ -428,4 +470,4 @@ with cD3:
     st.download_button("Fitted curve (CSV)", data=out_df.to_csv(index=False).encode("utf-8"),
                        file_name="fit_curve.csv", mime="text/csv")
 
-st.caption("Lock parameters you know from literature/measurements (e.g., R_s from EIS, i_L from hydrodynamics, Eeq from pH/reference).")
+st.caption("Tip: Lock parameters you know (e.g., R_s from EIS, i_L from hydrodynamics, Eeq from pH/reference).")
